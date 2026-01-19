@@ -1,111 +1,147 @@
 const std = @import("std");
 
+const SystemKind = enum {
+    mutable_fedora,
+    immutable_fedora,
+    ostree_non_fedora,
+    mutable_non_fedora,
+};
+
+const SupportedKind = enum {
+    mutable_fedora,
+    immutable_fedora,
+};
+
 pub fn main() !void {
-    //Print intro text and explain options (b/r)
+    // create a buffered writer for stdout
     // make buffer
     var stdout_buffer: [1024]u8 = undefined;
     // create writer
     var stdout_writer = std.fs.File.stdout().writer(&stdout_buffer);
     // get interface
-    const stdout = &stdout_writer.interface;
+    const out = &stdout_writer.interface;
+    // flush at the end
+    defer out.flush() catch {};
 
     // print intro
-    try stdout.print("distro-migrater-f2fi starting...\n", .{});
-    // clean memory
-    try stdout.flush();
+    try out.print("distro-migrater-f2fi starting...\n", .{});
 
-    // ostree = isOstreeSystem()
-    // fedora = isFedoraSystem()
-    //print:
-    //    ostree: true/false
-    //    fedora: true/false
+    // Detect system type:
+    //   ostree = isOstreeSystem()
+    const ostree = try isOstreeSystem();
+    //   fedora = isFedoraSystem()
+    const fedora = try isFedoraSystem();
 
-    // if ostree && fedora:
-    //    print " OK: Immutable Fedora system detected."
-    // else if !ostree && fedora:
-    //    print " OK: Mutable Fedora system detected."
-    // else if ostree && !fedora:
-    //    print " Unsupported: Immutable non-Fedora system detected. Exiting."
-    // else:
-    //    print " Unsupported: Mutable non-Fedora system detected. Exiting."
+    // assign results from detection to system kind
+    const kind: SystemKind = if (ostree and fedora)
+        .immutable_fedora
+    else if (!ostree and fedora)
+        .mutable_fedora
+    else if (ostree and !fedora)
+        .ostree_non_fedora
+    else
+        .mutable_non_fedora;
 
+    // print detection summary for debugging:
+    try out.print("System detection summary:\n", .{});
+    try out.print("  ostree: {}\n", .{ostree});
+    try out.print("  fedora: {}\n", .{fedora});
+    // dnf: true/false
+
+    // Implement dnf detection later
+    //   If "dnf" executable exists in PATH -> dnf = true
+    //   else -> dnf = false
+
+    // print messages for each system type
+    // and assign value for supported systems for interactive prompt
+    const supported: SupportedKind = switch (kind) {
+        .immutable_fedora => blk: {
+            try out.print("Immutable Fedora system detected. Backup mode initializing...\n", .{});
+            break :blk .immutable_fedora;
+        },
+        .mutable_fedora => blk: {
+            try out.print("Mutable Fedora system detected. Restore mode initializing...\n", .{});
+            break :blk .mutable_fedora;
+        },
+        else => {
+            try out.print("Unsupported system detected. Exiting.\n", .{});
+            return;
+        },
+    };
+
+    // ---------------------INTERACTIVE PROMPT---------------------
     // make buffer for reader and create reader
     var stdin_buffer: [128]u8 = undefined;
     var stdin_reader = std.fs.File.stdin().reader(&stdin_buffer);
-    const stdin = &stdin_reader.interface;
+    const in = &stdin_reader.interface;
 
-    //
-    // Detect dnf:
-    //   If "dnf" executable exists in PATH -> dnf = true
-    //   else -> dnf = false
-    //
-    // Print detection summary:
-    //    ostree: true/false
-    //    fedora: true/false
-    //    dnf: true/false
-    //
-    // Decide:
-    //    if ostree and fedora -> immutable fedora (OK)
-    //    else if fedora and dnf -> mutable fedora (OK)
-    //    else -> unsupported (exit)
-
+    // start interactive prompt loop
     while (true) {
-        // 1) print prompt
-        try stdout.print("Press b for backup or r for restore: ", .{});
-        try stdout.flush();
-        // 2) read a line from stdin
-        // for later: const raw_line = (try stdin.takeDelimiter('\n')) orelse break;
-        const maybe = try stdin.takeDelimiter('\n');
+        switch (supported) {
+            // Give instructions to backup if immutable fedora
+            .immutable_fedora => {
+                try out.print("Press b to backup your dotfiles and a list of your layered apps and flatpaks: ", .{});
+                try out.flush();
+            },
+            // Give instructions to restore if mutable fedora
+            .mutable_fedora => {
+                try out.print("Press r to restore your dotfiles and install your layered apps and flatpaks as RPM: ", .{});
+                try out.flush();
+            },
+        }
+
+        // read a line from stdin
+        const maybe = try in.takeDelimiter('\n');
         if (maybe == null) {
-            try stdout.print("EOF received, exiting...\n", .{});
-            try stdout.flush();
+            try out.print("EOF received, exiting...\n", .{});
             break;
         }
+
+        // save untrimmed line
         const raw_line = maybe.?;
 
         // trim whitespace and newlines
         const line = std.mem.trim(u8, raw_line, " \t\n\r");
 
-        // 3) if empty -> continue
+        // if empty -> continue
         if (line.len == 0) {
             continue;
         }
-        // 4) char = lowercase(first char)
+        // char = lowercase(first char)
         const first_char = std.ascii.toLower(line[0]);
-        // 5) if b -> confirm + runBackup + break
-        if (first_char == 'b') {
-            try stdout.print("Starting backup...\n", .{});
-            try stdout.flush();
-            try runBackup(stdout);
-            break;
+
+        // create variable for allowed action
+        const maybe_action = parseAction(first_char, supported);
+
+        // handle invalid actions
+        if (maybe_action == null) {
+            // print invalid action message
+            try out.print("Invalid action for your system type. Please follow the instructions above.\n", .{});
+            continue;
         }
-        // 6) if r -> confirm + runRestore + break
-        if (first_char == 'r') {
-            try stdout.print("Starting restore...\n", .{});
-            try stdout.flush();
-            try runRestore(stdout);
-            break;
+
+        // handle valid actions
+        const action = maybe_action.?;
+
+        switch (action) {
+            .backup => {
+                try out.print("Starting backup...\n", .{});
+                try runBackup(out);
+                try out.print("Backup completed successfully.\n", .{});
+            },
+            .restore => {
+                try out.print("Starting restore...\n", .{});
+                try runRestore(out);
+                try out.print("Restore completed successfully.\n", .{});
+            },
         }
-        // 7) else -> print "please only use..."
-        try stdout.print("Please only use r for restore or b for backup.\n", .{});
-        try stdout.flush();
+        break;
     }
 }
 
-fn runBackup(stdout: anytype) !void {
-    // TODO: later this will do environment checks + create tar + manifest
-    try stdout.print("TODO: backup not implemented yet.\n", .{});
-    try stdout.flush();
-}
-
-fn runRestore(stdout: anytype) !void {
-    // TODO: later this will reaad manifest + install flatpaks + restore configs
-    try stdout.print("TODO: restore not implemented yet.\n", .{});
-    try stdout.flush();
-}
+// ---------------------HELPER FUNCTIONS---------------------
 
 // ostree detection function
-// isOstreeSystem():
 fn isOstreeSystem() !bool {
     // marker_path = "/run/ostree-booted"
     const marker_path = "/run/ostree-booted";
@@ -125,7 +161,7 @@ fn isOstreeSystem() !bool {
     return true;
 }
 
-// isFedoraSystem():
+// fedora detection function
 //    open "/etc/os-release" for reading
 fn isFedoraSystem() !bool {
     const os_release_path = "/etc/os-release";
@@ -143,13 +179,13 @@ fn isFedoraSystem() !bool {
     defer file.close();
 
     // if open succeeded:
-    // create buffer
+    //  create buffer
     var buffer: [1024]u8 = undefined;
-    // create reader
+    //  create reader
     var reader = file.reader(&buffer);
-    // create interface
+    //  create interface
     const reader_interface = &reader.interface;
-    // read line by line
+    //  read line by line
     const line_delimiter: u8 = '\n';
 
     while (true) {
@@ -177,4 +213,42 @@ fn isFedoraSystem() !bool {
         }
     }
     return false;
+}
+
+// ---------------------ACTION HANDLING + RUNNERS---------------------
+
+// classify allowed action per system type
+const Action = enum {
+    backup,
+    restore,
+};
+
+// call allowed action functions for given input char and system kind
+fn parseAction(char: u8, kind: SupportedKind) ?Action {
+    switch (kind) {
+        .immutable_fedora => {
+            if (char == 'b') {
+                return .backup;
+            } else {
+                return null;
+            }
+        },
+        .mutable_fedora => {
+            if (char == 'r') {
+                return .restore;
+            } else {
+                return null;
+            }
+        },
+    }
+}
+
+// TODO: later this will do environment checks + create tar + manifest
+fn runBackup(stdout: anytype) !void {
+    try stdout.print("Backup function not yet implemented.\n", .{});
+}
+
+// TODO: later this will reaad manifest + install flatpaks + restore configs
+fn runRestore(stdout: anytype) !void {
+    try stdout.print("Restore function not yet implemented.\n", .{});
 }
