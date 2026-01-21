@@ -13,54 +13,37 @@ const SupportedKind = enum {
 };
 
 pub fn main() !void {
-    // create a buffered writer for stdout
-    // make buffer
+    // stdout (buffered)
     var stdout_buffer: [1024]u8 = undefined;
-    // create writer
     var stdout_writer = std.fs.File.stdout().writer(&stdout_buffer);
-    // get interface
     const out = &stdout_writer.interface;
-    // flush at the end
     defer out.flush() catch {};
 
-    // print intro
     try out.print("distro-migrater-f2fi starting...\n", .{});
 
-    // Detect system type:
-    //   ostree = isOstreeSystem()
     const ostree = try isOstreeSystem();
-    //   fedora = isFedoraSystem()
-    const fedora = try isFedoraSystem();
+    const fedora_like = try isFedoraLikeSystem();
 
-    // assign results from detection to system kind
-    const kind: SystemKind = if (ostree and fedora)
+    const kind: SystemKind = if (ostree and fedora_like)
         .immutable_fedora
-    else if (!ostree and fedora)
+    else if (!ostree and fedora_like)
         .mutable_fedora
-    else if (ostree and !fedora)
+    else if (ostree and !fedora_like)
         .ostree_non_fedora
     else
         .mutable_non_fedora;
 
-    // print detection summary for debugging:
     try out.print("System detection summary:\n", .{});
     try out.print("  ostree: {}\n", .{ostree});
-    try out.print("  fedora: {}\n", .{fedora});
-    // dnf: true/false
+    try out.print("  fedora_like: {}\n", .{fedora_like});
 
-    // Implement dnf detection later
-    //   If "dnf" executable exists in PATH -> dnf = true
-    //   else -> dnf = false
-
-    // print messages for each system type
-    // and assign value for supported systems for interactive prompt
     const supported: SupportedKind = switch (kind) {
         .immutable_fedora => blk: {
-            try out.print("Immutable Fedora system detected. Backup mode initializing...\n", .{});
+            try out.print("Immutable Fedora-like OSTree system detected. Backup mode initializing...\n", .{});
             break :blk .immutable_fedora;
         },
         .mutable_fedora => blk: {
-            try out.print("Mutable Fedora system detected. Restore mode initializing...\n", .{});
+            try out.print("Mutable Fedora-like system detected. Restore mode initializing...\n", .{});
             break :blk .mutable_fedora;
         },
         else => {
@@ -69,58 +52,41 @@ pub fn main() !void {
         },
     };
 
-    // ---------------------INTERACTIVE PROMPT---------------------
-    // make buffer for reader and create reader
+    // stdin (buffered)
     var stdin_buffer: [128]u8 = undefined;
     var stdin_reader = std.fs.File.stdin().reader(&stdin_buffer);
     const in = &stdin_reader.interface;
 
-    // start interactive prompt loop
     while (true) {
         switch (supported) {
-            // Give instructions to backup if immutable fedora
             .immutable_fedora => {
                 try out.print("Press b to backup your dotfiles and a list of your layered apps and flatpaks: ", .{});
                 try out.flush();
             },
-            // Give instructions to restore if mutable fedora
             .mutable_fedora => {
                 try out.print("Press r to restore your dotfiles and install your layered apps and flatpaks as RPM: ", .{});
                 try out.flush();
             },
         }
 
-        // read a line from stdin
         const maybe = try in.takeDelimiter('\n');
         if (maybe == null) {
             try out.print("EOF received, exiting...\n", .{});
             break;
         }
 
-        // save untrimmed line
         const raw_line = maybe.?;
-
-        // trim whitespace and newlines
         const line = std.mem.trim(u8, raw_line, " \t\n\r");
+        if (line.len == 0) continue;
 
-        // if empty -> continue
-        if (line.len == 0) {
-            continue;
-        }
-        // char = lowercase(first char)
         const first_char = std.ascii.toLower(line[0]);
 
-        // create variable for allowed action
         const maybe_action = parseAction(first_char, supported);
-
-        // handle invalid actions
         if (maybe_action == null) {
-            // print invalid action message
             try out.print("Invalid action for your system type. Please follow the instructions above.\n", .{});
             continue;
         }
 
-        // handle valid actions
         const action = maybe_action.?;
 
         switch (action) {
@@ -135,120 +101,185 @@ pub fn main() !void {
                 try out.print("Restore completed successfully.\n", .{});
             },
         }
+
         break;
     }
 }
 
-// ---------------------HELPER FUNCTIONS---------------------
+// ---------------------DETECTION FUNCTIONS---------------------
 
-// ostree detection function
 fn isOstreeSystem() !bool {
-    // marker_path = "/run/ostree-booted"
     const marker_path = "/run/ostree-booted";
-    // try to open marker_path for reading
-    // if open succeeds -> close -> return true
     var file = std.fs.openFileAbsolute(marker_path, .{}) catch |err| {
-        // if error.FileNotFound -> return false
         if (err == error.FileNotFound) {
             return false;
-            // else -> return the error (bubble up)
         } else {
             return err;
         }
     };
-    // if open succeeded: close file and return true
     defer file.close();
     return true;
 }
 
-// fedora detection function
-//    open "/etc/os-release" for reading
-fn isFedoraSystem() !bool {
+// helper to parse KEY=value or KEY="value" lines from /etc/os-release
+fn parseOsReleaseValue(line: []const u8, key: []const u8) ?[]const u8 {
+    if (!std.mem.startsWith(u8, line, key)) return null;
+    if (line.len <= key.len or line[key.len] != '=') return null;
+
+    const raw = line[(key.len + 1)..];
+    const trimmed = std.mem.trim(u8, raw, " \t\r\n\"'");
+    return trimmed;
+}
+
+// returns true if ID == "fedora" OR ID_LIKE contains "fedora"
+fn isFedoraLikeSystem() !bool {
     const os_release_path = "/etc/os-release";
-    // try to open os_release_path for reading
+
     var file = std.fs.openFileAbsolute(os_release_path, .{}) catch |err| {
-        // if error.FileNotFound -> return false
         if (err == error.FileNotFound) {
             return false;
-            // all other errors -> bubble up
         } else {
             return err;
         }
     };
-    // close file after any exit
     defer file.close();
 
-    // if open succeeded:
-    //  create buffer
     var buffer: [1024]u8 = undefined;
-    //  create reader
     var reader = file.reader(&buffer);
-    //  create interface
-    const reader_interface = &reader.interface;
-    //  read line by line
-    const line_delimiter: u8 = '\n';
+    const r = &reader.interface;
+
+    var found_id: ?[]const u8 = null;
+    var found_id_like: ?[]const u8 = null;
 
     while (true) {
-        // read line by line (take delimiter '\n')
-        const maybe_line = try reader_interface.takeDelimiter(line_delimiter);
-        if (maybe_line == null) {
-            // EOF reached -> return false
-            break;
-        }
-        const line = maybe_line.?;
-        // trim whitespace
-        const trimmed_line = std.mem.trim(u8, line, " \t\r\n");
+        const maybe_line = try r.takeDelimiter('\n');
+        if (maybe_line == null) break;
 
-        // if line starts with "ID=":
-        const id_prefix = "ID=";
-        if (std.mem.startsWith(u8, trimmed_line, id_prefix)) {
-            // value = line after "ID="
-            const value = trimmed_line[id_prefix.len..];
-            // trim quotes from value
-            const trimmed_value = std.mem.trim(u8, value, "\"'");
-            // if value == "fedora" -> return true and close file
-            if (std.mem.eql(u8, trimmed_value, "fedora")) {
-                return true;
+        const line = std.mem.trim(u8, maybe_line.?, " \t\r\n");
+        if (line.len == 0) continue;
+
+        if (found_id == null) {
+            if (parseOsReleaseValue(line, "ID")) |v| {
+                found_id = v;
+                std.debug.print("Detected OS ID: {s}\n", .{v});
             }
         }
+
+        if (found_id_like == null) {
+            if (parseOsReleaseValue(line, "ID_LIKE")) |v| {
+                found_id_like = v;
+                std.debug.print("Detected OS ID_LIKE: {s}\n", .{v});
+            }
+        }
+
+        if (found_id != null and found_id_like != null) break;
     }
+
+    if (found_id) |id| {
+        if (std.mem.eql(u8, id, "fedora")) return true;
+    }
+
+    if (found_id_like) |like| {
+        var it = std.mem.tokenizeScalar(u8, like, ' ');
+        while (it.next()) |tok_raw| {
+            const tok = std.mem.trim(u8, tok_raw, " \t\r\n\"'");
+            if (std.mem.eql(u8, tok, "fedora")) return true;
+        }
+    }
+
     return false;
 }
 
 // ---------------------ACTION HANDLING + RUNNERS---------------------
 
-// classify allowed action per system type
 const Action = enum {
     backup,
     restore,
 };
 
-// call allowed action functions for given input char and system kind
 fn parseAction(char: u8, kind: SupportedKind) ?Action {
     switch (kind) {
         .immutable_fedora => {
-            if (char == 'b') {
-                return .backup;
-            } else {
-                return null;
-            }
+            if (char == 'b') return .backup;
+            return null;
         },
         .mutable_fedora => {
-            if (char == 'r') {
-                return .restore;
-            } else {
-                return null;
-            }
+            if (char == 'r') return .restore;
+            return null;
         },
     }
 }
 
-// TODO: later this will do environment checks + create tar + manifest
-fn runBackup(stdout: anytype) !void {
-    try stdout.print("Backup function not yet implemented.\n", .{});
+fn runCmdAlloc(
+    allocator: std.mem.Allocator,
+    argv: []const []const u8,
+) ![]u8 {
+    var child = std.process.Child.init(argv, allocator);
+    child.stdin_behavior = .Ignore;
+    child.stdout_behavior = .Pipe;
+    child.stderr_behavior = .Pipe;
+
+    try child.spawn();
+
+    const stdout_bytes = try child.stdout.?.readToEndAlloc(allocator, 1024 * 1024 * 8); // 8MB cap
+    _ = try child.wait();
+
+    return stdout_bytes;
 }
 
-// TODO: later this will reaad manifest + install flatpaks + restore configs
+// Write a RELATIVE path (relative to the directory where the program is executed: cwd).
+fn writeFileRel(path: []const u8, data: []const u8) !void {
+    var f = try std.fs.cwd().createFile(path, .{ .truncate = true });
+    defer f.close();
+    try f.writeAll(data);
+}
+
+// ---------------------BACKUP/RESTORE FUNCTIONS---------------------
+
+// MVP: create folder, dump flatpak list, dump rpm-ostree status
+fn runBackup(out: anytype) !void {
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const ts = std.time.timestamp();
+    const dir_name = try std.fmt.allocPrint(a, "backups/backup-{d}", .{ts});
+
+    // ensure ./backups exists
+    std.fs.cwd().makePath("backups") catch |err| {
+        if (err != error.PathAlreadyExists) return err;
+    };
+
+    // ensure ./backups/backup-<ts> exists
+    std.fs.cwd().makePath(dir_name) catch |err| {
+        if (err != error.PathAlreadyExists) return err;
+    };
+
+    try out.print("Backup directory created at: {s}\n", .{dir_name});
+
+    // flatpak list
+    const flatpak_out = try runCmdAlloc(a, &.{
+        "flatpak",
+        "list",
+        "--app",
+        "--columns=application",
+    });
+    const flatpak_path = try std.fmt.allocPrint(a, "{s}/flatpak-list.txt", .{dir_name});
+    try writeFileRel(flatpak_path, flatpak_out);
+    try out.print("Wrote {s}\n", .{flatpak_path});
+
+    // rpm-ostree status
+    const ostree_out = try runCmdAlloc(a, &.{
+        "rpm-ostree",
+        "status",
+    });
+    const ostree_path = try std.fmt.allocPrint(a, "{s}/rpm-ostree-status.txt", .{dir_name});
+    try writeFileRel(ostree_path, ostree_out);
+    try out.print("Wrote {s}\n", .{ostree_path});
+
+    try out.print("Backup MVP done (lists only).\n", .{});
+}
+
 fn runRestore(stdout: anytype) !void {
     try stdout.print("Restore function not yet implemented.\n", .{});
 }
