@@ -60,13 +60,48 @@ const CmdResult = struct {
     term: std.process.Child.Term,
 };
 
+// Simple "tee" writer: prints to stdout and to a log file.
+// This lets us keep all terminal output in a log.
+const TeeOut = struct {
+    stdout: *std.io.Writer,
+    log: *std.io.Writer,
+
+    // Print to both destinations.
+    pub fn print(self: *TeeOut, comptime fmt: []const u8, args: anytype) !void {
+        try self.stdout.print(fmt, args);
+        try self.log.print(fmt, args);
+    }
+
+    // Flush both outputs (useful for prompts).
+    pub fn flush(self: *TeeOut) !void {
+        try self.stdout.flush();
+        try self.log.flush();
+    }
+};
+
 // `!void` means it can return an error instead of a value.
 pub fn main() !void {
     // make buffered writer for stdout
     // We create a buffer so prints are grouped efficiently.
     var stdout_buffer: [1024]u8 = undefined;
     var stdout_writer = std.fs.File.stdout().writer(&stdout_buffer);
-    const out = &stdout_writer.interface;
+    // Create a log file in the current working directory.
+    // Name format: log-<unix_timestamp>.log
+    var log_name_buf: [64]u8 = undefined;
+    const log_name = try std.fmt.bufPrint(&log_name_buf, "log-{d}.log", .{std.time.timestamp()});
+    var log_file = try std.fs.cwd().createFile(log_name, .{ .truncate = true });
+    defer log_file.close();
+
+    // Buffered log writer for smoother file output.
+    var log_buffer: [1024]u8 = undefined;
+    var log_writer = log_file.writer(&log_buffer);
+
+    // Use TeeOut so every print goes to both stdout and the log.
+    var tee = TeeOut{
+        .stdout = &stdout_writer.interface,
+        .log = &log_writer.interface,
+    };
+    const out = &tee;
     // `defer` runs at the end of the scope (like cleanup in C).
     defer out.flush() catch {};
 
@@ -397,8 +432,54 @@ fn writeLinesRel(path: []const u8, lines: []const []const u8) !void {
 
 // get $HOME environment variable
 fn getHomeDir(a: std.mem.Allocator) ![]const u8 {
-    // Returns a heap-allocated copy of $HOME.
+    // If running with sudo, prefer the original user's home.
+    if (std.process.getEnvVarOwned(a, "SUDO_USER")) |sudo_user| {
+        defer a.free(sudo_user);
+        if (try lookupHomeFromPasswd(a, sudo_user)) |home| {
+            return home;
+        }
+    } else |_| {}
+
+    // Fallback: use $HOME from the current environment.
     return try std.process.getEnvVarOwned(a, "HOME");
+}
+
+// Look up a user's home directory by reading /etc/passwd.
+// This avoids restoring configs into /root when running under sudo.
+fn lookupHomeFromPasswd(a: std.mem.Allocator, user: []const u8) !?[]const u8 {
+    var file = std.fs.openFileAbsolute("/etc/passwd", .{}) catch |err| {
+        if (err == error.FileNotFound) return null;
+        return err;
+    };
+    defer file.close();
+
+    var buffer: [1024]u8 = undefined;
+    var reader = file.reader(&buffer);
+    const r = &reader.interface;
+
+    while (true) {
+        const maybe_line = try r.takeDelimiter('\n');
+        if (maybe_line == null) break;
+        const line = std.mem.trim(u8, maybe_line.?, " \t\r\n");
+        if (line.len == 0) continue;
+
+        // /etc/passwd lines are: name:x:uid:gid:gecos:home:shell
+        if (!std.mem.startsWith(u8, line, user)) continue;
+        if (line.len <= user.len or line[user.len] != ':') continue;
+
+        var parts = std.mem.splitScalar(u8, line, ':');
+        _ = parts.next(); // name
+        _ = parts.next(); // x
+        _ = parts.next(); // uid
+        _ = parts.next(); // gid
+        _ = parts.next(); // gecos
+        const home = parts.next() orelse return null;
+
+        // Return an owned copy of the home path.
+        return try a.dupe(u8, home);
+    }
+
+    return null;
 }
 
 // Parse the flatpak-list output: tab-separated columns
@@ -641,6 +722,14 @@ fn runBackup(out: anytype) !void {
     try writeFileRel(flatpak_path, flatpak_out);
     try out.print("Wrote {s}\n", .{flatpak_path});
 
+    // Parse the list so we can show the user what was saved.
+    const flatpak_entries = try parseFlatpakListFromBytes(a, flatpak_out);
+    try out.print("Flatpaks saved ({d}):\n", .{flatpak_entries.len});
+    for (flatpak_entries) |fp| {
+        // Print just the app id to keep the list readable.
+        try out.print("  - {s}\n", .{fp.app_id});
+    }
+
     // Backup Flatpak configs
     try backupFlatpakConfigs(a, out, dir_name, flatpak_out);
 
@@ -705,6 +794,13 @@ fn runRestore(out: anytype, in: anytype) !void {
     // Collect RPM package names chosen by the user.
     var rpm_to_install = ArrayListManaged([]const u8).init(a);
     defer rpm_to_install.deinit();
+    // Track Flatpaks that did not map to an RPM.
+    var skipped_flatpaks = ArrayListManaged([]const u8).init(a);
+    defer skipped_flatpaks.deinit();
+    // Track install status for the final summary.
+    var install_status: []const u8 = "not attempted";
+    // If an error happens later, still print a summary before exiting.
+    errdefer printRestoreSummary(out, rpm_to_install.items, skipped_flatpaks.items, install_status) catch {};
 
     // For each Flatpak, try to resolve it to an RPM package interactively.
     for (flatpaks) |fp| {
@@ -712,6 +808,8 @@ fn runRestore(out: anytype, in: anytype) !void {
         if (chosen) |pkg_name| {
             try rpm_to_install.append(pkg_name);
         } else {
+            // Keep track of skipped apps for the summary.
+            try skipped_flatpaks.append(fp.app_id);
             try out.print(
                 "Skipping (manual install needed): {s} (origin={s}, branch={s})\n",
                 .{ fp.app_id, fp.origin, fp.branch },
@@ -722,9 +820,14 @@ fn runRestore(out: anytype, in: anytype) !void {
     // Install the selected RPM packages via dnf.
     if (rpm_to_install.items.len != 0) {
         try out.print("\nInstalling selected RPMs ({d}) via dnf...\n", .{rpm_to_install.items.len});
-        try dnfInstallPkgs(a, out, rpm_to_install.items);
+        dnfInstallPkgs(a, out, rpm_to_install.items) catch |err| {
+            install_status = "failed";
+            return err;
+        };
+        install_status = "success";
         try out.print("RPM install done.\n", .{});
     } else {
+        install_status = "not attempted (no RPMs selected)";
         try out.print("\nNo RPMs selected for installation from Flatpak conversion.\n", .{});
     }
 
@@ -735,6 +838,9 @@ fn runRestore(out: anytype, in: anytype) !void {
     // NEW: Restore general ~/.config backup (merge)
     try out.print("\nRestoring ~/.config (dot-config) into ~/.config/...\n", .{}); // NEW
     try restoreDotConfig(a, out, backup_dir); // NEW
+
+    // Print a clear summary at the end so the user can audit the result.
+    try printRestoreSummary(out, rpm_to_install.items, skipped_flatpaks.items, install_status);
 }
 
 // list ./backups/backup-* and let user pick
@@ -1004,9 +1110,58 @@ fn dnfInstallPkgs(a: std.mem.Allocator, out: anytype, pkgs: []const []const u8) 
     try argv.append("-y");
     for (pkgs) |p| try argv.append(p);
 
-    // Run the command and surface any errors.
-    const cmd_out = try runCmdCheckedAlloc(a, argv.items, out);
-    a.free(cmd_out);
+    // Run the command and capture full output for the log.
+    const res = try runCmdAlloc(a, argv.items);
+    defer a.free(res.stdout);
+    defer a.free(res.stderr);
+
+    // Print stdout/stderr so the log shows exactly what dnf reported.
+    if (res.stdout.len != 0) {
+        try out.print("dnf output:\n{s}\n", .{res.stdout});
+    }
+    if (res.stderr.len != 0) {
+        try out.print("dnf stderr:\n{s}\n", .{res.stderr});
+    }
+
+    // Treat non-zero exit codes as failure.
+    switch (res.term) {
+        .Exited => |code| {
+            if (code != 0) {
+                try out.print("Command failed (exit code {d}):", .{code});
+                for (argv.items) |arg| try out.print(" {s}", .{arg});
+                try out.print("\n", .{});
+                return error.CommandFailed;
+            }
+        },
+        else => {
+            try out.print("Command did not exit normally:", .{});
+            for (argv.items) |arg| try out.print(" {s}", .{arg});
+            try out.print("\n", .{});
+            return error.CommandFailed;
+        },
+    }
+}
+
+// Print an end-of-restore summary so the user can audit results.
+fn printRestoreSummary(
+    out: anytype,
+    rpm_to_install: []const []const u8,
+    skipped_flatpaks: []const []const u8,
+    install_status: []const u8,
+) !void {
+    try out.print("\nRestore summary:\n", .{});
+    try out.print("  RPMs selected: {d}\n", .{rpm_to_install.len});
+    try out.print("  RPM install status: {s}\n", .{install_status});
+    if (rpm_to_install.len != 0) {
+        try out.print("  RPM list:\n", .{});
+        for (rpm_to_install) |p| try out.print("    - {s}\n", .{p});
+    }
+    try out.print("  Flatpaks skipped (manual install): {d}\n", .{skipped_flatpaks.len});
+    if (skipped_flatpaks.len != 0) {
+        try out.print("  Skipped Flatpak list:\n", .{});
+        for (skipped_flatpaks) |fp| try out.print("    - {s}\n", .{fp});
+    }
+    try out.print("  Config restore steps completed (see log for details).\n", .{});
 }
 
 // ----------------------DOT-CONFIG RESTORE---------------------
