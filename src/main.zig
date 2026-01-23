@@ -128,9 +128,6 @@ pub fn main() !void {
     // `defer` runs at the end of the scope (like cleanup in C).
     defer out.flush() catch {};
 
-    // print startup message
-    try out.print("distro-migrater-f2fi starting...\n", .{});
-
     // assign system detection results to variables
     // `try` means: if this errors, return the error from main.
     const ostree = try isOstreeSystem();
@@ -147,20 +144,13 @@ pub fn main() !void {
     else
         .mutable_non_fedora;
 
-    // print detection summary
-    try out.print("System detection summary:\n", .{});
-    try out.print("  ostree: {}\n", .{ostree});
-    try out.print("  fedora_like: {}\n", .{fedora_like});
-
     // inform the user about supported/unsupported systems
     // `switch` picks one branch based on the enum value.
     const supported: SupportedKind = switch (kind) {
         .immutable_fedora => blk: {
-            try out.print("Immutable Fedora-like OSTree system detected. Backup mode initializing...\n", .{});
             break :blk .immutable_fedora;
         },
         .mutable_fedora => blk: {
-            try out.print("Mutable Fedora-like system detected. Restore mode initializing...\n", .{});
             break :blk .mutable_fedora;
         },
         else => {
@@ -168,6 +158,30 @@ pub fn main() !void {
             return;
         },
     };
+
+    // If this is a restore-only system, re-exec via sudo before we print banners.
+    // This avoids duplicate startup output.
+    if (supported == .mutable_fedora) {
+        try ensureRootOrReexec(out);
+    }
+
+    // print startup message
+    try out.print("distro-migrater-f2fi starting...\n", .{});
+
+    // print detection summary
+    try out.print("System detection summary:\n", .{});
+    try out.print("  ostree: {}\n", .{ostree});
+    try out.print("  fedora_like: {}\n", .{fedora_like});
+
+    // inform the user about supported/unsupported systems
+    switch (supported) {
+        .immutable_fedora => {
+            try out.print("Immutable Fedora-like OSTree system detected. Backup mode initializing...\n", .{});
+        },
+        .mutable_fedora => {
+            try out.print("Mutable Fedora-like system detected. Restore mode initializing...\n", .{});
+        },
+    }
 
     // make buffered reader for stdin
     // This lets us read user input line by line.
@@ -180,12 +194,6 @@ pub fn main() !void {
         "Warning: restoring configs between different desktop environments (e.g., KDE -> GNOME) can cause issues.\n",
         .{},
     );
-
-    // If this is a restore-only system, re-exec via sudo before we prompt.
-    // This avoids prompting the user twice.
-    if (supported == .mutable_fedora) {
-        try ensureRootOrReexec(out);
-    }
 
     // inform user about available actions and prompt
     // Loop until we get a valid action or EOF.
