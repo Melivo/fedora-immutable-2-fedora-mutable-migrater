@@ -476,15 +476,18 @@ fn runCmdCheckedAlloc(
 }
 
 // Run a command with inherited stdout/stderr and enforce success.
+// We do this for chatty commands so we avoid pipe deadlocks and show live progress.
 fn runCmdCheckedInherit(
     allocator: std.mem.Allocator,
     argv: []const []const u8,
     out: anytype,
 ) !void {
+    // Spawn the process and let it print directly to the terminal.
     const term = try runCmdInherit(allocator, argv);
     switch (term) {
         .Exited => |code| {
             if (code != 0) {
+                // Non-zero exit means the command failed.
                 try out.print("Command failed (exit code {d}):", .{code});
                 for (argv) |arg| try out.print(" {s}", .{arg});
                 try out.print("\n", .{});
@@ -492,6 +495,7 @@ fn runCmdCheckedInherit(
             }
         },
         else => {
+            // Any non-normal termination is treated as an error.
             try out.print("Command did not exit normally:", .{});
             for (argv) |arg| try out.print(" {s}", .{arg});
             try out.print("\n", .{});
@@ -883,11 +887,19 @@ fn runBackup(out: anytype) !void {
     // CHANGED: We still call rpm-ostree status --json, but we do NOT store the huge JSON anymore.
     // Instead we extract only the layered/requested packages and write layered-rpms.txt.
     // Run rpm-ostree status --json to get layered package info.
-    const ostree_json = try runCmdCheckedAlloc(a, &.{
+    const ostree_json = runCmdCheckedAlloc(a, &.{
         "rpm-ostree",
         "status",
         "--json",
-    }, out); // CHANGED: capture JSON only as input for extraction
+    }, out) catch |err| {
+        if (err == error.StreamTooLong) {
+            try out.print(
+                "rpm-ostree status output too large to capture; try again after pruning deployments or increase the capture cap.\n",
+                .{},
+            );
+        }
+        return err;
+    }; // CHANGED: capture JSON only as input for extraction
 
     // Extract package names and write them to layered-rpms.txt.
     const layered = try extractLayeredRpmsFromOstreeJsonBytes(a, ostree_json); // NEW
