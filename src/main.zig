@@ -543,17 +543,22 @@ fn lookupHomeFromPasswd(a: std.mem.Allocator, user: []const u8) !?[]const u8 {
     return null;
 }
 
+// Look up a user's uid and gid by reading /etc/passwd.
 fn lookupUserIdsFromPasswd(a: std.mem.Allocator, user: []const u8) !?UserIds {
+    // Read /etc/passwd and find the line for the given user.
+    // That line contains uid/gid as plain numbers, which we parse below.
     var file = std.fs.openFileAbsolute("/etc/passwd", .{}) catch |err| {
         if (err == error.FileNotFound) return null;
         return err;
     };
     defer file.close();
 
+    // make buffered reader
     var buffer: [1024]u8 = undefined;
     var reader = file.reader(&buffer);
     const r = &reader.interface;
 
+    // Read the file line-by-line because /etc/passwd is a text file.
     while (true) {
         const maybe_line = try r.takeDelimiter('\n');
         if (maybe_line == null) break;
@@ -564,6 +569,7 @@ fn lookupUserIdsFromPasswd(a: std.mem.Allocator, user: []const u8) !?UserIds {
         if (!std.mem.startsWith(u8, line, user)) continue;
         if (line.len <= user.len or line[user.len] != ':') continue;
 
+        // Split on ':' to pull out the uid and gid fields.
         var parts = std.mem.splitScalar(u8, line, ':');
         _ = parts.next(); // name
         _ = parts.next(); // x
@@ -573,6 +579,7 @@ fn lookupUserIdsFromPasswd(a: std.mem.Allocator, user: []const u8) !?UserIds {
         _ = parts.next(); // home
         _ = parts.next(); // shell
 
+        // Convert uid/gid from strings to integers so we can pass them to chown.
         const uid = std.fmt.parseInt(u32, uid_str, 10) catch return null;
         const gid = std.fmt.parseInt(u32, gid_str, 10) catch return null;
         return .{
@@ -582,6 +589,7 @@ fn lookupUserIdsFromPasswd(a: std.mem.Allocator, user: []const u8) !?UserIds {
         };
     }
 
+    // No matching user found in /etc/passwd.
     return null;
 }
 
@@ -915,6 +923,9 @@ fn runRestore(out: anytype, in: anytype) !void {
     // Collect RPM package names chosen by the user.
     var rpm_to_install = ArrayListManaged([]const u8).init(a);
     defer rpm_to_install.deinit();
+    // Cache for dnf existence checks to avoid repeated queries.
+    var dnf_cache = std.StringHashMap(bool).init(a);
+    defer dnf_cache.deinit();
     // Track Flatpaks that did not map to an RPM.
     var skipped_flatpaks = ArrayListManaged(SkippedApp).init(a);
     defer skipped_flatpaks.deinit();
@@ -925,7 +936,7 @@ fn runRestore(out: anytype, in: anytype) !void {
 
     // For each Flatpak, try to resolve it to an RPM package interactively.
     for (flatpaks) |fp| {
-        const result = try resolveFlatpakToRpmInteractive(a, out, in, fp);
+        const result = try resolveFlatpakToRpmInteractive(a, out, in, &dnf_cache, fp);
         if (result.chosen) |pkg_name| {
             try rpm_to_install.append(pkg_name);
         } else {
@@ -943,8 +954,18 @@ fn runRestore(out: anytype, in: anytype) !void {
 
     // Install the selected RPM packages via dnf.
     if (rpm_to_install.items.len != 0) {
-        try out.print("\nInstalling selected RPMs ({d}) via dnf...\n", .{rpm_to_install.items.len});
-        dnfInstallPkgs(a, out, rpm_to_install.items) catch |err| {
+        var uniq = std.StringHashMap(void).init(a);
+        defer uniq.deinit();
+        var rpm_uniq = ArrayListManaged([]const u8).init(a);
+        defer rpm_uniq.deinit();
+        for (rpm_to_install.items) |p| {
+            if (!uniq.contains(p)) {
+                _ = try uniq.put(p, {});
+                try rpm_uniq.append(p);
+            }
+        }
+        try out.print("\nInstalling selected RPMs ({d}) via dnf...\n", .{rpm_uniq.items.len});
+        dnfInstallPkgs(a, out, rpm_uniq.items) catch |err| {
             install_status = "failed";
             return err;
         };
@@ -1214,6 +1235,9 @@ fn loadLayeredRpmsFromStatusJson(
         }
     }.lessThan);
 
+    if (out_list.items.len == 0) {
+        try out.print("No requested packages detected in status JSON.\n", .{});
+    }
     try out.print("Loaded layered RPM list from rpm-ostree-status.json (fallback)\n", .{}); // NEW
     return try out_list.toOwnedSlice();
 }
@@ -1442,6 +1466,7 @@ fn resolveFlatpakToRpmInteractive(
     a: std.mem.Allocator,
     out: anytype,
     in: anytype,
+    dnf_cache: *std.StringHashMap(bool),
     fp: FlatpakEntry,
 ) !ResolveResult {
     // Show the Flatpak we are trying to convert.
@@ -1458,7 +1483,13 @@ fn resolveFlatpakToRpmInteractive(
 
     // Check each candidate
     for (candidates) |cand| {
-        if (try dnfPackageExists(a, out, cand)) {
+        if (dnf_cache.get(cand)) |exists| {
+            if (exists) try existing.append(cand);
+            continue;
+        }
+        const exists = try dnfPackageExists(a, out, cand);
+        try dnf_cache.put(cand, exists);
+        if (exists) {
             try existing.append(cand);
         }
     }
