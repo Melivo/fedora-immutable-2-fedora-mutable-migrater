@@ -1,7 +1,7 @@
 // distro-migrater-f2fi: Fedora immutable (based) to Fedora mutable migration tool
 //
 // Backup mode (on immutable):
-//   - Creates ./backups/backup-<unix_ts>/
+//   - Creates ./backups/backup-<unix_ts>/ (relative to current working dir)
 //   - Captures:
 //       1) flatpak-list.txt
 //       2) layered-rpms.txt               <-- CHANGED: minimal output instead of huge rpm-ostree JSON
@@ -14,12 +14,17 @@
 //   - Converts Flatpaks to RPM candidates (interactive)
 //   - Restores Flatpak configs into ~/.config/<name>/
 //   - Restores dot-config into ~/.config/ (merge)
+//   - Fixes ownership of restored configs to the invoking user when using sudo
+//   - Prompts if required text files are missing, then continues or aborts
 //
 // Design principle:
 //   - No fuzzy auto-install without user consent.
 //   - If ambiguous: ask. If unknown: report and skip.
 //
-// CAVEAT: needs sudo for dnf and rpm-ostree commands.
+// Logging:
+//   - Writes log-<timestamp>.log next to the executable (fallback: current dir)
+//
+// CAVEAT: needs sudo for restore (dnf + file ownership changes).
 
 // Zig standard library: filesystem, process, json, etc.
 const std = @import("std");
