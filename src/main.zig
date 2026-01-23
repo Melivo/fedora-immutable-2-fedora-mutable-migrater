@@ -108,11 +108,24 @@ pub fn main() !void {
     // We buffer so prints are grouped efficiently.
     var stdout_buffer: [1024]u8 = undefined;
     var stdout_writer = std.fs.File.stdout().writer(&stdout_buffer);
-    // Create a log file in the current working directory.
+    // Create a log file next to the executable so logs stay with the tool.
     // Name format: log-<unix_timestamp>.log
     var log_name_buf: [64]u8 = undefined;
     const log_name = try std.fmt.bufPrint(&log_name_buf, "log-{d}.log", .{std.time.timestamp()});
-    var log_file = try std.fs.cwd().createFile(log_name, .{ .truncate = true });
+    const gpa = std.heap.page_allocator;
+    const exe_path = std.fs.selfExePathAlloc(gpa) catch null;
+    var log_file: std.fs.File = undefined;
+    if (exe_path) |p| {
+        defer gpa.free(p);
+        // Compute "<exe_dir>/<log_name>" and create the file there.
+        const exe_dir = std.fs.path.dirname(p) orelse ".";
+        const log_path = try std.fmt.allocPrint(gpa, "{s}/{s}", .{ exe_dir, log_name });
+        defer gpa.free(log_path);
+        log_file = try std.fs.cwd().createFile(log_path, .{ .truncate = true });
+    } else {
+        // Fallback: current working directory if exe path is unavailable.
+        log_file = try std.fs.cwd().createFile(log_name, .{ .truncate = true });
+    }
     defer log_file.close();
 
     // Buffered log writer for smoother file output.
@@ -1089,14 +1102,38 @@ fn pickBackupDir(a: std.mem.Allocator, out: anytype, in: anytype) ![]const u8 {
     // Open the "backups" directory so we can list its subfolders.
     var backups_dir = std.fs.cwd().openDir("backups", .{ .iterate = true }) catch |err| {
         if (err == error.FileNotFound) {
-            try out.print("No ./backups directory found. Nothing to restore.\n", .{});
-            return error.NoBackups;
+            // If running from another directory, try a sibling "backups"
+            // next to the executable (common when running from USB).
+            const exe_path = try std.fs.selfExePathAlloc(a);
+            const exe_dir = std.fs.path.dirname(exe_path) orelse ".";
+            const alt_path = try std.fmt.allocPrint(a, "{s}/backups", .{exe_dir});
+            var alt_dir = std.fs.cwd().openDir(alt_path, .{ .iterate = true }) catch |err2| {
+                if (err2 == error.FileNotFound) {
+                    try out.print("No ./backups directory found. Nothing to restore.\n", .{});
+                    return error.NoBackups;
+                }
+                return err2;
+            };
+            defer alt_dir.close();
+            // Reuse the same picker logic, but with the fallback directory.
+            return try pickBackupDirFromDir(a, out, in, alt_dir, alt_path);
         }
         return err;
     };
     defer backups_dir.close();
 
-    // Iterator for directory entries.
+    // Normal case: use ./backups from the current working directory.
+    return try pickBackupDirFromDir(a, out, in, backups_dir, "backups");
+}
+
+fn pickBackupDirFromDir(
+    a: std.mem.Allocator,
+    out: anytype,
+    in: anytype,
+    backups_dir: std.fs.Dir,
+    base_path: []const u8,
+) ![]const u8 {
+    // Iterator for directory entries in the chosen backups directory.
     var it = backups_dir.iterate();
     var names = ArrayListManaged([]const u8).init(a);
     defer names.deinit();
@@ -1124,7 +1161,7 @@ fn pickBackupDir(a: std.mem.Allocator, out: anytype, in: anytype) ![]const u8 {
         }
     }.lessThan);
 
-    // Display choices
+    // Display choices.
     try out.print("\nAvailable backups:\n", .{});
     for (names.items, 0..) |n, i| {
         try out.print("  {d}) {s}\n", .{ i + 1, n });
@@ -1158,7 +1195,7 @@ fn pickBackupDir(a: std.mem.Allocator, out: anytype, in: anytype) ![]const u8 {
 
         // Build the final path to the chosen backup.
         const chosen_name = names.items[idx - 1];
-        return try std.fmt.allocPrint(a, "backups/{s}", .{chosen_name});
+        return try std.fmt.allocPrint(a, "{s}/{s}", .{ base_path, chosen_name });
     }
 }
 
