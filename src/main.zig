@@ -181,6 +181,12 @@ pub fn main() !void {
         .{},
     );
 
+    // If this is a restore-only system, re-exec via sudo before we prompt.
+    // This avoids prompting the user twice.
+    if (supported == .mutable_fedora) {
+        try ensureRootOrReexec(out);
+    }
+
     // inform user about available actions and prompt
     // Loop until we get a valid action or EOF.
     while (true) {
@@ -233,7 +239,6 @@ pub fn main() !void {
             },
             .restore => {
                 try out.print("Starting restore...\n", .{});
-                try ensureRootOrReexec(out);
                 try runRestore(out, in);
                 try out.print("Restore flow completed.\n", .{});
             },
@@ -363,14 +368,18 @@ fn parseAction(char: u8, kind: SupportedKind) ?Action {
 
 // Ensure restore runs as root; if not, re-exec via sudo.
 fn ensureRootOrReexec(out: anytype) !void {
+    // Check if we are root (effective UID 0).
     if (std.posix.geteuid() == 0) return;
 
     try out.print("Restore requires root. Re-executing via sudo...\n", .{});
+    try out.flush();
 
+    // Prepare to re-exec via sudo.
     var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer arena.deinit();
     const a = arena.allocator();
 
+    // Get current process arguments.
     const args = try std.process.argsAlloc(a);
     var argv = ArrayListManaged([]const u8).init(a);
     defer argv.deinit();
@@ -378,11 +387,13 @@ fn ensureRootOrReexec(out: anytype) !void {
     try argv.append("--");
     for (args) |arg| try argv.append(arg);
 
+    // Set up the child process to run sudo with inherited stdio.
     var child = std.process.Child.init(argv.items, a);
     child.stdin_behavior = .Inherit;
     child.stdout_behavior = .Inherit;
     child.stderr_behavior = .Inherit;
 
+    // spawn the sudo command
     child.spawn() catch |err| {
         if (err == error.FileNotFound) {
             try out.print("sudo not found. Please re-run as root.\n", .{});
@@ -390,6 +401,7 @@ fn ensureRootOrReexec(out: anytype) !void {
         return err;
     };
 
+    // wait for sudo to finish and exit with the same code
     const term = try child.wait();
     switch (term) {
         .Exited => |code| std.process.exit(code),
