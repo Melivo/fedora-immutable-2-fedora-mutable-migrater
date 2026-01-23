@@ -1080,6 +1080,7 @@ fn runRestore(out: anytype, in: anytype) !void {
         };
         install_status = "success";
         try out.print("RPM install done.\n", .{});
+        try verifyInstalledRpmExecutables(a, out, rpm_uniq.items);
     } else {
         install_status = "not attempted (no RPMs selected)";
         try out.print("\nNo RPMs selected for installation from Flatpak conversion.\n", .{});
@@ -1426,6 +1427,65 @@ fn dnfInstallPkgs(a: std.mem.Allocator, out: anytype, pkgs: []const []const u8) 
             try out.print("\n", .{});
             return error.CommandFailed;
         },
+    }
+}
+
+// After installs, verify whether each package provides a binary named like the package.
+fn verifyInstalledRpmExecutables(a: std.mem.Allocator, out: anytype, pkgs: []const []const u8) !void {
+    if (pkgs.len == 0) return;
+
+    // This is a helpful post-check: some RPMs don't ship a binary with the same name
+    // as the package (e.g., flatseal -> com.github.tchx84.Flatseal).
+    try out.print("\nVerifying installed RPM executables:\n", .{});
+    for (pkgs) |pkg| {
+        // First try a simple PATH lookup for a binary that matches the package name.
+        const which_res = try runCmdAlloc(a, &.{ "which", pkg });
+        defer a.free(which_res.stdout);
+        defer a.free(which_res.stderr);
+
+        const found = switch (which_res.term) {
+            .Exited => |code| code == 0,
+            else => false,
+        };
+
+        if (found and which_res.stdout.len != 0) {
+            continue;
+        }
+
+        // If "which" fails, list files from the RPM and look for binaries.
+        const res = try runCmdAlloc(a, &.{ "rpm", "-ql", pkg });
+        defer a.free(res.stdout);
+        defer a.free(res.stderr);
+
+        const ok = switch (res.term) {
+            .Exited => |code| code == 0,
+            else => false,
+        };
+        if (!ok) {
+            try out.print("  {s}: installed, but rpm -ql failed.\n", .{pkg});
+            continue;
+        }
+
+        // Scan the file list for /bin or /libexec entries.
+        var it = std.mem.splitScalar(u8, res.stdout, '\n');
+        var count: usize = 0;
+        while (it.next()) |line| {
+            if (line.len == 0) continue;
+            if (std.mem.indexOf(u8, line, "/bin/") == null and std.mem.indexOf(u8, line, "/libexec/") == null) {
+                continue;
+            }
+            if (count == 0) {
+                try out.print("  {s}: no `{s}` in PATH. Binaries:\n", .{ pkg, pkg });
+            }
+            if (count < 5) {
+                try out.print("    - {s}\n", .{line});
+            }
+            count += 1;
+        }
+
+        if (count == 0) {
+            try out.print("  {s}: no `{s}` in PATH; no bin/libexec entries found.\n", .{ pkg, pkg });
+        }
     }
 }
 
