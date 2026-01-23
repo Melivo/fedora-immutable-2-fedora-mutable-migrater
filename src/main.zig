@@ -664,6 +664,24 @@ fn parseFlatpakListFromBytes(a: std.mem.Allocator, data: []const u8) ![]FlatpakE
     return try entries.toOwnedSlice();
 }
 
+fn askContinue(out: anytype, in: anytype, msg: []const u8) !bool {
+    // Simple y/n prompt; hitting Enter defaults to "no".
+    while (true) {
+        try out.print("{s} Continue? [y/N]: ", .{msg});
+        try out.flush();
+
+        const maybe_line = try in.takeDelimiter('\n');
+        if (maybe_line == null) return error.EOF;
+        const line = std.mem.trim(u8, maybe_line.?, " \t\r\n");
+        if (line.len == 0) return false;
+
+        const first = std.ascii.toLower(line[0]);
+        if (first == 'y') return true;
+        if (first == 'n') return false;
+        try out.print("Please answer y or n.\n", .{});
+    }
+}
+
 // Backup: copy ~/.var/app/<app_id>/config -> <backupdir>/flatpak-configs/<app_id>/config
 fn backupFlatpakConfigs(
     // allocator for temporary strings
@@ -688,16 +706,23 @@ fn backupFlatpakConfigs(
         if (err != error.PathAlreadyExists) return err;
     };
 
-    // Track how many configs we successfully copied.
+    // Track how many configs we successfully copied and skipped so we can
+    // report progress at the end.
     var copied_count: usize = 0;
+    var skipped_count: usize = 0;
 
     for (entries) |fp| {
         // Build the absolute source path for this app's config.
         const src_abs = try std.fmt.allocPrint(a, "{s}/.var/app/{s}/config", .{ home, fp.app_id });
 
-        // Existence check (dir) WITHOUT leaking the handle
+        // Existence check (dir) WITHOUT leaking the handle.
+        // If the config dir doesn't exist, we skip this app.
         var src_dir = std.fs.openDirAbsolute(src_abs, .{}) catch |err| {
-            if (err == error.FileNotFound) continue; // no config dir -> skip
+            if (err == error.FileNotFound) {
+                skipped_count += 1;
+                try out.print("No Flatpak config dir for {s} -> skipping.\n", .{fp.app_id});
+                continue;
+            }
             return err;
         };
         src_dir.close();
@@ -717,7 +742,10 @@ fn backupFlatpakConfigs(
         try out.print("Backed up Flatpak config: {s} -> {s}/\n", .{ src_abs, dst_rel });
     }
 
-    try out.print("Flatpak config backup done. Copied {d} config dirs.\n", .{copied_count});
+    try out.print(
+        "Flatpak config backup done. Copied {d}, skipped {d}.\n",
+        .{ copied_count, skipped_count },
+    );
 }
 
 // NEW: Backup ~/.config into <backup>/dot-config/
@@ -941,7 +969,7 @@ fn runRestore(out: anytype, in: anytype) !void {
 
     // CHANGED: prefer the minimal layered-rpms.txt; fallback to old rpm-ostree-status.json.
     // Load the list of layered RPMs from the backup.
-    const layered = try loadLayeredRpms(a, out, backup_dir); // CHANGED
+    const layered = try loadLayeredRpms(a, out, in, backup_dir); // CHANGED
     if (layered.len != 0) {
         try out.print("\nLayered RPMs found in backup ({d}):\n", .{layered.len});
         for (layered) |p| try out.print("  - {s}\n", .{p});
@@ -953,7 +981,7 @@ fn runRestore(out: anytype, in: anytype) !void {
     }
 
     // Load the Flatpak list we backed up.
-    const flatpaks = try loadFlatpakList(a, out, backup_dir);
+    const flatpaks = try loadFlatpakList(a, out, in, backup_dir);
     if (flatpaks.len == 0) {
         try out.print("\nNo Flatpaks found in backup.\n", .{});
         // Even if no Flatpaks, we still restore ~/.config because it’s useful.
@@ -1113,10 +1141,10 @@ fn pickBackupDir(a: std.mem.Allocator, out: anytype, in: anytype) ![]const u8 {
 // ---------------------LAYERED RPM LOADING---------------------
 
 // Load layered RPMs from backup (tries layered-rpms.txt first, then falls back to rpm-ostree-status.json)
-fn loadLayeredRpms(a: std.mem.Allocator, out: anytype, backup_dir: []const u8) ![][]const u8 {
+fn loadLayeredRpms(a: std.mem.Allocator, out: anytype, in: anytype, backup_dir: []const u8) ![][]const u8 {
     // CHANGED: new main loader: prefer layered-rpms.txt for minimal relevant data.
     // This returns either a list of packages or falls back to old JSON.
-    if (try loadLayeredRpmsFromTxt(a, out, backup_dir)) |pkgs| {
+    if (try loadLayeredRpmsFromTxt(a, out, in, backup_dir)) |pkgs| {
         return pkgs;
     }
 
@@ -1125,12 +1153,21 @@ fn loadLayeredRpms(a: std.mem.Allocator, out: anytype, backup_dir: []const u8) !
 }
 
 //  load layered-rpms.txt (one package name per line)
-fn loadLayeredRpmsFromTxt(a: std.mem.Allocator, out: anytype, backup_dir: []const u8) !?[][]const u8 {
+fn loadLayeredRpmsFromTxt(a: std.mem.Allocator, out: anytype, in: anytype, backup_dir: []const u8) !?[][]const u8 {
     // NEW: reads "<backup>/layered-rpms.txt" (one package per line)
     // Returning null here means "file not found, use fallback".
     const path = try std.fmt.allocPrint(a, "{s}/layered-rpms.txt", .{backup_dir});
     var f = std.fs.cwd().openFile(path, .{}) catch |err| {
-        if (err == error.FileNotFound) return null; // NEW: signal “use fallback”
+        if (err == error.FileNotFound) {
+            // Ask the user before falling back to the older JSON file.
+            const ok = try askContinue(
+                out,
+                in,
+                "layered-rpms.txt is missing; fallback to rpm-ostree-status.json.",
+            );
+            if (!ok) return error.UserAborted;
+            return null; // NEW: signal “use fallback”
+        }
         return err;
     };
     defer f.close();
@@ -1144,7 +1181,7 @@ fn loadLayeredRpmsFromTxt(a: std.mem.Allocator, out: anytype, backup_dir: []cons
     var list = ArrayListManaged([]const u8).init(a);
     defer list.deinit();
 
-    // Parse lines
+    // Parse lines. Slices reference this file buffer; the arena owns the data.
     while (lines.next()) |raw| {
         const s = std.mem.trim(u8, raw, " \t\r\n");
         if (s.len == 0) continue;
@@ -1159,12 +1196,18 @@ fn loadLayeredRpmsFromTxt(a: std.mem.Allocator, out: anytype, backup_dir: []cons
 // ---------------------FLATPAK LIST LOADING---------------------
 
 // Load and parse flatpak-list.txt (tab-separated columns)
-fn loadFlatpakList(a: std.mem.Allocator, out: anytype, backup_dir: []const u8) ![]FlatpakEntry {
+fn loadFlatpakList(a: std.mem.Allocator, out: anytype, in: anytype, backup_dir: []const u8) ![]FlatpakEntry {
     // Load the flatpak-list.txt file from the backup directory.
     const path = try std.fmt.allocPrint(a, "{s}/flatpak-list.txt", .{backup_dir});
     var f = std.fs.cwd().openFile(path, .{}) catch |err| {
         if (err == error.FileNotFound) {
-            try out.print("No flatpak-list.txt in {s}\n", .{backup_dir});
+            // Ask the user before skipping Flatpak restore entirely.
+            const ok = try askContinue(
+                out,
+                in,
+                "flatpak-list.txt is missing; Flatpak restore will be skipped.",
+            );
+            if (!ok) return error.UserAborted;
             return &[_]FlatpakEntry{};
         }
         return err;
