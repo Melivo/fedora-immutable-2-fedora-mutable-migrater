@@ -1449,6 +1449,10 @@ fn restoreFlatpakConfigs(
     };
     defer dir.close();
 
+    // Track name collisions (two Flatpaks mapping to same dest name).
+    var name_map = std.StringHashMap([]const u8).init(a);
+    defer name_map.deinit();
+
     // Iterate subdirectories
     var it = dir.iterate();
     // Count how many configs we restore.
@@ -1461,6 +1465,16 @@ fn restoreFlatpakConfigs(
         // Each subdirectory name is a Flatpak app id.
         const app_id = entry.name;
         const name = try flatpakAppIdToConfigName(a, app_id);
+        if (name_map.get(name)) |existing_app| {
+            if (!std.mem.eql(u8, existing_app, app_id)) {
+                try out.print(
+                    "Warning: Flatpak config name collision: {s} and {s} -> ~/.config/{s}\n",
+                    .{ existing_app, app_id, name },
+                );
+            }
+        } else {
+            _ = try name_map.put(name, try a.dupe(u8, app_id));
+        }
 
         // Source is the backed up config path; destination is ~/.config/<name>.
         const src_abs = try std.fmt.allocPrint(a, "{s}/{s}/config", .{ src_root_rel, app_id });
