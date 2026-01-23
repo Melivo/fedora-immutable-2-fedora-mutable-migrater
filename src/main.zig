@@ -208,6 +208,7 @@ pub fn main() !void {
             },
             .restore => {
                 try out.print("Starting restore...\n", .{});
+                try ensureRootOrReexec(out);
                 try runRestore(out, in);
                 try out.print("Restore flow completed.\n", .{});
             },
@@ -332,6 +333,43 @@ fn parseAction(char: u8, kind: SupportedKind) ?Action {
             if (char == 'r') return .restore;
             return null;
         },
+    }
+}
+
+// Ensure restore runs as root; if not, re-exec via sudo.
+fn ensureRootOrReexec(out: anytype) !void {
+    if (std.posix.geteuid() == 0) return;
+
+    try out.print("Restore requires root. Re-executing via sudo...\n", .{});
+
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const args = try std.process.argsAlloc(a);
+    var argv = ArrayListManaged([]const u8).init(a);
+    defer argv.deinit();
+    try argv.append("sudo");
+    try argv.append("--");
+    for (args) |arg| try argv.append(arg);
+
+    var child = std.process.Child.init(argv.items, a);
+    child.stdin_behavior = .Inherit;
+    child.stdout_behavior = .Inherit;
+    child.stderr_behavior = .Inherit;
+
+    child.spawn() catch |err| {
+        if (err == error.FileNotFound) {
+            try out.print("sudo not found. Please re-run as root.\n", .{});
+        }
+        return err;
+    };
+
+    const term = try child.wait();
+    switch (term) {
+        .Exited => |code| std.process.exit(code),
+        .Signal => |sig| std.process.exit(128 + @as(u8, @intCast(sig))),
+        else => std.process.exit(1),
     }
 }
 
