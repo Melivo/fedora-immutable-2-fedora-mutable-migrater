@@ -18,6 +18,7 @@
 // Design principle:
 //   - No fuzzy auto-install without user consent.
 //   - If ambiguous: ask. If unknown: report and skip.
+//
 // CAVEAT: needs sudo for dnf and rpm-ostree commands.
 
 // Zig standard library: filesystem, process, json, etc.
@@ -79,13 +80,19 @@ const CmdResult = struct {
 // Simple "tee" writer: prints to stdout and to a log file.
 // This lets us keep all terminal output in a log.
 const TeeOut = struct {
-    stdout: std.io.AnyWriter,
-    log: std.io.AnyWriter,
+    stdout: *std.io.Writer,
+    log: *std.io.Writer,
 
     // Print to both destinations.
     pub fn print(self: *TeeOut, comptime fmt: []const u8, args: anytype) !void {
         try self.stdout.print(fmt, args);
         try self.log.print(fmt, args);
+    }
+
+    // Flush both outputs (useful for prompts).
+    pub fn flush(self: *TeeOut) !void {
+        try self.stdout.flush();
+        try self.log.flush();
     }
 };
 
@@ -93,8 +100,8 @@ const TeeOut = struct {
 pub fn main() !void {
     // Make buffered writer for stdout.
     // We buffer so prints are grouped efficiently.
-    var stdout_buffered = std.io.bufferedWriter(std.fs.File.stdout().writer());
-    var stdout_writer = stdout_buffered.writer();
+    var stdout_buffer: [1024]u8 = undefined;
+    var stdout_writer = std.fs.File.stdout().writer(&stdout_buffer);
     // Create a log file in the current working directory.
     // Name format: log-<unix_timestamp>.log
     var log_name_buf: [64]u8 = undefined;
@@ -103,20 +110,17 @@ pub fn main() !void {
     defer log_file.close();
 
     // Buffered log writer for smoother file output.
-    var log_buffered = std.io.bufferedWriter(log_file.writer());
-    var log_writer = log_buffered.writer();
+    var log_buffer: [1024]u8 = undefined;
+    var log_writer = log_file.writer(&log_buffer);
 
     // Use TeeOut so every print goes to both stdout and the log.
     var tee = TeeOut{
-        .stdout = stdout_writer.any(),
-        .log = log_writer.any(),
+        .stdout = &stdout_writer.interface,
+        .log = &log_writer.interface,
     };
     const out = &tee;
     // `defer` runs at the end of the scope (like cleanup in C).
-    defer {
-        stdout_buffered.flush() catch {};
-        log_buffered.flush() catch {};
-    }
+    defer out.flush() catch {};
 
     // print startup message
     try out.print("distro-migrater-f2fi starting...\n", .{});
