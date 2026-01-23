@@ -69,6 +69,12 @@ const ResolveResult = struct {
     skip_reason: ?SkipReason,
 };
 
+const UserIds = struct {
+    name: []const u8,
+    uid: u32,
+    gid: u32,
+};
+
 // command result (stdout + stderr + termination info)
 // We keep both outputs plus how the command exited.
 const CmdResult = struct {
@@ -537,6 +543,48 @@ fn lookupHomeFromPasswd(a: std.mem.Allocator, user: []const u8) !?[]const u8 {
     return null;
 }
 
+fn lookupUserIdsFromPasswd(a: std.mem.Allocator, user: []const u8) !?UserIds {
+    var file = std.fs.openFileAbsolute("/etc/passwd", .{}) catch |err| {
+        if (err == error.FileNotFound) return null;
+        return err;
+    };
+    defer file.close();
+
+    var buffer: [1024]u8 = undefined;
+    var reader = file.reader(&buffer);
+    const r = &reader.interface;
+
+    while (true) {
+        const maybe_line = try r.takeDelimiter('\n');
+        if (maybe_line == null) break;
+        const line = std.mem.trim(u8, maybe_line.?, " \t\r\n");
+        if (line.len == 0) continue;
+
+        // /etc/passwd lines are: name:x:uid:gid:gecos:home:shell
+        if (!std.mem.startsWith(u8, line, user)) continue;
+        if (line.len <= user.len or line[user.len] != ':') continue;
+
+        var parts = std.mem.splitScalar(u8, line, ':');
+        _ = parts.next(); // name
+        _ = parts.next(); // x
+        const uid_str = parts.next() orelse return null;
+        const gid_str = parts.next() orelse return null;
+        _ = parts.next(); // gecos
+        _ = parts.next(); // home
+        _ = parts.next(); // shell
+
+        const uid = std.fmt.parseInt(u32, uid_str, 10) catch return null;
+        const gid = std.fmt.parseInt(u32, gid_str, 10) catch return null;
+        return .{
+            .name = try a.dupe(u8, user),
+            .uid = uid,
+            .gid = gid,
+        };
+    }
+
+    return null;
+}
+
 // Parse the flatpak-list output: tab-separated columns
 fn parseFlatpakListFromBytes(a: std.mem.Allocator, data: []const u8) ![]FlatpakEntry {
     // Split the text by newline characters.
@@ -819,6 +867,23 @@ fn runRestore(out: anytype, in: anytype) !void {
     defer arena.deinit();
     const a = arena.allocator();
 
+    const restore_user: ?UserIds = blk: {
+        if (std.posix.geteuid() != 0) break :blk null;
+        const sudo_user = std.process.getEnvVarOwned(a, "SUDO_USER") catch |err| switch (err) {
+            error.EnvironmentVariableNotFound => break :blk null,
+            else => return err,
+        };
+        defer a.free(sudo_user);
+        if (try lookupUserIdsFromPasswd(a, sudo_user)) |ids| {
+            break :blk ids;
+        }
+        try out.print(
+            "Warning: SUDO_USER {s} not found in /etc/passwd; leaving ownership unchanged.\n",
+            .{sudo_user},
+        );
+        break :blk null;
+    };
+
     // Ask the user which backup folder to use.
     const backup_dir = try pickBackupDir(a, out, in);
 
@@ -841,7 +906,7 @@ fn runRestore(out: anytype, in: anytype) !void {
         try out.print("\nNo Flatpaks found in backup.\n", .{});
         // Even if no Flatpaks, we still restore ~/.config because it’s useful.
         try out.print("\nRestoring ~/.config (dot-config) into ~/.config/...\n", .{}); // NEW
-        try restoreDotConfig(a, out, backup_dir); // NEW
+        try restoreDotConfig(a, out, backup_dir, restore_user); // NEW
         return;
     }
 
@@ -892,11 +957,11 @@ fn runRestore(out: anytype, in: anytype) !void {
 
     // Restore Flatpak configs
     try out.print("\nRestoring Flatpak configs into ~/.config/...\n", .{});
-    try restoreFlatpakConfigs(a, out, backup_dir);
+    try restoreFlatpakConfigs(a, out, backup_dir, restore_user);
 
     // NEW: Restore general ~/.config backup (merge)
     try out.print("\nRestoring ~/.config (dot-config) into ~/.config/...\n", .{}); // NEW
-    try restoreDotConfig(a, out, backup_dir); // NEW
+    try restoreDotConfig(a, out, backup_dir, restore_user); // NEW
 
     // Print a clear summary at the end so the user can audit the result.
     try printRestoreSummary(out, rpm_to_install.items, skipped_flatpaks.items, install_status);
@@ -1233,7 +1298,12 @@ fn printRestoreSummary(
 // ----------------------DOT-CONFIG RESTORE---------------------
 
 // Restore: copy <backupdir>/dot-config/. -> ~/.config/
-fn restoreDotConfig(a: std.mem.Allocator, out: anytype, backup_dir: []const u8) !void {
+fn restoreDotConfig(
+    a: std.mem.Allocator,
+    out: anytype,
+    backup_dir: []const u8,
+    restore_user: ?UserIds,
+) !void {
     // NEW: restore "<backup>/dot-config/" into "~/.config/" as a merge.
     // This is intentionally “copy-on-top”, because ~/.config already exists on the target system.
     // We copy files from the backup into the existing config folder.
@@ -1265,6 +1335,12 @@ fn restoreDotConfig(a: std.mem.Allocator, out: anytype, backup_dir: []const u8) 
     a.free(cp_out);
 
     try out.print("Restored dot-config -> {s}\n", .{dst_abs}); // NEW
+    if (restore_user) |ids| {
+        const owner = try std.fmt.allocPrint(a, "{d}:{d}", .{ ids.uid, ids.gid });
+        const chown_out = try runCmdCheckedAlloc(a, &.{ "chown", "-R", owner, dst_abs }, out);
+        a.free(chown_out);
+        try out.print("Adjusted ownership -> {s} ({s})\n", .{ dst_abs, ids.name });
+    }
 }
 
 // ----------------------FLATPAK CONFIG RESTORE---------------------
@@ -1296,7 +1372,12 @@ fn flatpakAppIdToConfigName(a: std.mem.Allocator, app_id: []const u8) ![]const u
 }
 
 // Restore: copy <backupdir>/flatpak-configs/<app_id>/config/. -> ~/.config/<name>/
-fn restoreFlatpakConfigs(a: std.mem.Allocator, out: anytype, backup_dir: []const u8) !void {
+fn restoreFlatpakConfigs(
+    a: std.mem.Allocator,
+    out: anytype,
+    backup_dir: []const u8,
+    restore_user: ?UserIds,
+) !void {
     // HOME used to build destination paths.
     const home = try getHomeDir(a);
 
@@ -1338,6 +1419,12 @@ fn restoreFlatpakConfigs(a: std.mem.Allocator, out: anytype, backup_dir: []const
         const src_with_dot = try std.fmt.allocPrint(a, "{s}/.", .{src_abs});
         const cp_out = try runCmdCheckedAlloc(a, &.{ "cp", "-a", src_with_dot, dst_abs }, out);
         a.free(cp_out);
+
+        if (restore_user) |ids| {
+            const owner = try std.fmt.allocPrint(a, "{d}:{d}", .{ ids.uid, ids.gid });
+            const chown_out = try runCmdCheckedAlloc(a, &.{ "chown", "-R", owner, dst_abs }, out);
+            a.free(chown_out);
+        }
 
         // Update progress count and log it.
         restored_count += 1;
