@@ -396,7 +396,11 @@ fn ensureRootOrReexec(out: anytype) !void {
     for (args) |arg| try argv.append(arg);
 
     // Set up the child process to run sudo with inherited stdio.
+    // We also preserve the current working directory so relative paths
+    // like "./backups" keep working after the re-exec.
     var child = std.process.Child.init(argv.items, a);
+    const cwd = try std.process.getCwdAlloc(a);
+    child.cwd = cwd;
     child.stdin_behavior = .Inherit;
     child.stdout_behavior = .Inherit;
     child.stderr_behavior = .Inherit;
