@@ -53,6 +53,21 @@ const FlatpakEntry = struct {
     branch: []const u8,
 };
 
+const SkipReason = enum {
+    not_in_repo,
+    could_not_resolve,
+};
+
+const SkippedApp = struct {
+    app_id: []const u8,
+    reason: SkipReason,
+};
+
+const ResolveResult = struct {
+    chosen: ?[]const u8,
+    skip_reason: ?SkipReason,
+};
+
 // command result (stdout + stderr + termination info)
 // We keep both outputs plus how the command exited.
 const CmdResult = struct {
@@ -831,7 +846,7 @@ fn runRestore(out: anytype, in: anytype) !void {
     var rpm_to_install = ArrayListManaged([]const u8).init(a);
     defer rpm_to_install.deinit();
     // Track Flatpaks that did not map to an RPM.
-    var skipped_flatpaks = ArrayListManaged([]const u8).init(a);
+    var skipped_flatpaks = ArrayListManaged(SkippedApp).init(a);
     defer skipped_flatpaks.deinit();
     // Track install status for the final summary.
     var install_status: []const u8 = "not attempted";
@@ -840,12 +855,15 @@ fn runRestore(out: anytype, in: anytype) !void {
 
     // For each Flatpak, try to resolve it to an RPM package interactively.
     for (flatpaks) |fp| {
-        const chosen = try resolveFlatpakToRpmInteractive(a, out, in, fp);
-        if (chosen) |pkg_name| {
+        const result = try resolveFlatpakToRpmInteractive(a, out, in, fp);
+        if (result.chosen) |pkg_name| {
             try rpm_to_install.append(pkg_name);
         } else {
             // Keep track of skipped apps for the summary.
-            try skipped_flatpaks.append(fp.app_id);
+            try skipped_flatpaks.append(.{
+                .app_id = fp.app_id,
+                .reason = result.skip_reason.?,
+            });
             try out.print(
                 "Skipping (manual install needed): {s} (origin={s}, branch={s})\n",
                 .{ fp.app_id, fp.origin, fp.branch },
@@ -1182,7 +1200,7 @@ fn dnfInstallPkgs(a: std.mem.Allocator, out: anytype, pkgs: []const []const u8) 
 fn printRestoreSummary(
     out: anytype,
     rpm_to_install: []const []const u8,
-    skipped_flatpaks: []const []const u8,
+    skipped_flatpaks: []const SkippedApp,
     install_status: []const u8,
 ) !void {
     try out.print("\nRestore summary:\n", .{});
@@ -1194,8 +1212,14 @@ fn printRestoreSummary(
     }
     try out.print("  Flatpaks skipped (manual install): {d}\n", .{skipped_flatpaks.len});
     if (skipped_flatpaks.len != 0) {
-        try out.print("  Skipped Flatpak list:\n", .{});
-        for (skipped_flatpaks) |fp| try out.print("    - {s}\n", .{fp});
+        try out.print("  Apps to install manually:\n", .{});
+        for (skipped_flatpaks) |fp| {
+            const reason_str = switch (fp.reason) {
+                .not_in_repo => "not in repo",
+                .could_not_resolve => "could not be resolved",
+            };
+            try out.print("    - {s} (reason: {s})\n", .{ fp.app_id, reason_str });
+        }
     }
     try out.print("  Config restore steps completed (see log for details).\n", .{});
 }
@@ -1326,7 +1350,7 @@ fn resolveFlatpakToRpmInteractive(
     out: anytype,
     in: anytype,
     fp: FlatpakEntry,
-) !?[]const u8 {
+) !ResolveResult {
     // Show the Flatpak we are trying to convert.
     try out.print("\nFlatpak: {s} (origin={s}, branch={s})\n", .{ fp.app_id, fp.origin, fp.branch });
 
@@ -1368,14 +1392,14 @@ fn resolveFlatpakToRpmInteractive(
     if (unique_existing.items.len == 0) {
         try out.print("No unambiguous RPM candidate found.\n", .{});
         try out.print("Action: please install manually.\n", .{});
-        return null;
+        return .{ .chosen = null, .skip_reason = .not_in_repo };
     }
 
     // Unique match
     if (unique_existing.items.len == 1) {
         const chosen = unique_existing.items[0];
         try out.print("Resolved uniquely -> RPM: {s}\n", .{chosen});
-        return chosen;
+        return .{ .chosen = chosen, .skip_reason = null };
     }
 
     // Multiple matches -> ask user
@@ -1405,7 +1429,7 @@ fn resolveFlatpakToRpmInteractive(
         };
 
         // 0 means "skip this app".
-        if (n == 0) return null;
+        if (n == 0) return .{ .chosen = null, .skip_reason = .could_not_resolve };
         if (n > unique_existing.items.len) {
             try out.print("Out of range.\n", .{});
             continue;
@@ -1414,7 +1438,7 @@ fn resolveFlatpakToRpmInteractive(
         // Valid choice
         const chosen = unique_existing.items[n - 1];
         try out.print("Chosen -> RPM: {s}\n", .{chosen});
-        return chosen;
+        return .{ .chosen = chosen, .skip_reason = null };
     }
 }
 
