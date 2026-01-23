@@ -421,6 +421,16 @@ fn runCmdAlloc(allocator: std.mem.Allocator, argv: []const []const u8) !CmdResul
     return .{ .stdout = stdout_bytes, .stderr = stderr_bytes, .term = term };
 }
 
+// run command and inherit stdout/stderr (avoids pipe deadlocks for chatty commands)
+fn runCmdInherit(allocator: std.mem.Allocator, argv: []const []const u8) !std.process.Child.Term {
+    var child = std.process.Child.init(argv, allocator);
+    child.stdin_behavior = .Inherit;
+    child.stdout_behavior = .Inherit;
+    child.stderr_behavior = .Inherit;
+    try child.spawn();
+    return try child.wait();
+}
+
 // enforce success so you don’t create “valid-looking but incomplete” backups/restores
 fn runCmdCheckedAlloc(
     // allocator for temporary output buffers
@@ -463,6 +473,31 @@ fn runCmdCheckedAlloc(
     // We keep stdout but can free stderr now.
     allocator.free(res.stderr);
     return res.stdout;
+}
+
+// Run a command with inherited stdout/stderr and enforce success.
+fn runCmdCheckedInherit(
+    allocator: std.mem.Allocator,
+    argv: []const []const u8,
+    out: anytype,
+) !void {
+    const term = try runCmdInherit(allocator, argv);
+    switch (term) {
+        .Exited => |code| {
+            if (code != 0) {
+                try out.print("Command failed (exit code {d}):", .{code});
+                for (argv) |arg| try out.print(" {s}", .{arg});
+                try out.print("\n", .{});
+                return error.CommandFailed;
+            }
+        },
+        else => {
+            try out.print("Command did not exit normally:", .{});
+            for (argv) |arg| try out.print(" {s}", .{arg});
+            try out.print("\n", .{});
+            return error.CommandFailed;
+        },
+    }
 }
 
 // ----------------------FILE HELPERS---------------------
@@ -671,8 +706,7 @@ fn backupFlatpakConfigs(
 
         // cp -a <src_abs> <dst_rel>/
         // This creates: <dst_rel>/config
-        const cp_out = try runCmdCheckedAlloc(a, &.{ "cp", "-a", src_abs, dst_rel }, out);
-        a.free(cp_out);
+        try runCmdCheckedInherit(a, &.{ "cp", "-a", src_abs, dst_rel }, out);
 
         // Update progress count and log it.
         copied_count += 1;
@@ -697,15 +731,13 @@ fn backupDotConfig(
     const dst_rel = try std.fmt.allocPrint(a, "{s}/dot-config", .{backup_dir}); // CHANGED/NEW
 
     // Ensure destination exists.
-    const mk_out = try runCmdCheckedAlloc(a, &.{ "mkdir", "-p", dst_rel }, out); // NEW
-    a.free(mk_out);
+    try runCmdCheckedInherit(a, &.{ "mkdir", "-p", dst_rel }, out); // NEW
 
     // Copy the *contents* of ~/.config into dot-config:
     // Using "/." copies contents rather than nesting the directory.
     // This avoids creating a second ".config" folder inside dot-config.
     const src_with_dot = try std.fmt.allocPrint(a, "{s}/.", .{src_abs}); // NEW
-    const cp_out = try runCmdCheckedAlloc(a, &.{ "cp", "-a", src_with_dot, dst_rel }, out); // NEW
-    a.free(cp_out);
+    try runCmdCheckedInherit(a, &.{ "cp", "-a", src_with_dot, dst_rel }, out); // NEW
 
     try out.print("Backed up ~/.config -> {s}\n", .{dst_rel}); // NEW
 }
@@ -1259,21 +1291,11 @@ fn dnfInstallPkgs(a: std.mem.Allocator, out: anytype, pkgs: []const []const u8) 
     try argv.append("-y");
     for (pkgs) |p| try argv.append(p);
 
-    // Run the command and capture full output for the log.
-    const res = try runCmdAlloc(a, argv.items);
-    defer a.free(res.stdout);
-    defer a.free(res.stderr);
-
-    // Print stdout/stderr so the log shows exactly what dnf reported.
-    if (res.stdout.len != 0) {
-        try out.print("dnf output:\n{s}\n", .{res.stdout});
-    }
-    if (res.stderr.len != 0) {
-        try out.print("dnf stderr:\n{s}\n", .{res.stderr});
-    }
+    // Run dnf with inherited stdout/stderr for live progress output.
+    const term = try runCmdInherit(a, argv.items);
 
     // Treat non-zero exit codes as failure.
-    switch (res.term) {
+    switch (term) {
         .Exited => |code| {
             if (code != 0) {
                 try out.print("Command failed (exit code {d}):", .{code});
@@ -1350,19 +1372,16 @@ fn restoreDotConfig(
 
     // Ensure destination exists (normally it does, but keep it robust).
     // This avoids errors if ~/.config is missing.
-    const mk_out = try runCmdCheckedAlloc(a, &.{ "mkdir", "-p", dst_abs }, out); // NEW
-    a.free(mk_out);
+    try runCmdCheckedInherit(a, &.{ "mkdir", "-p", dst_abs }, out); // NEW
 
     // Copy the *contents* of dot-config into ~/.config.
     const src_with_dot = try std.fmt.allocPrint(a, "{s}/.", .{src_abs}); // NEW
-    const cp_out = try runCmdCheckedAlloc(a, &.{ "cp", "-a", src_with_dot, dst_abs }, out); // NEW
-    a.free(cp_out);
+    try runCmdCheckedInherit(a, &.{ "cp", "-a", src_with_dot, dst_abs }, out); // NEW
 
     try out.print("Restored dot-config -> {s}\n", .{dst_abs}); // NEW
     if (restore_user) |ids| {
         const owner = try std.fmt.allocPrint(a, "{d}:{d}", .{ ids.uid, ids.gid });
-        const chown_out = try runCmdCheckedAlloc(a, &.{ "chown", "-R", owner, dst_abs }, out);
-        a.free(chown_out);
+        try runCmdCheckedInherit(a, &.{ "chown", "-R", owner, dst_abs }, out);
         try out.print("Adjusted ownership -> {s} ({s})\n", .{ dst_abs, ids.name });
     }
 }
@@ -1436,18 +1455,15 @@ fn restoreFlatpakConfigs(
         const dst_abs = try std.fmt.allocPrint(a, "{s}/.config/{s}", .{ home, name });
 
         // Ensure destination directory exists.
-        const mk_out = try runCmdCheckedAlloc(a, &.{ "mkdir", "-p", dst_abs }, out);
-        a.free(mk_out);
+        try runCmdCheckedInherit(a, &.{ "mkdir", "-p", dst_abs }, out);
 
         // Copy the contents of the config directory.
         const src_with_dot = try std.fmt.allocPrint(a, "{s}/.", .{src_abs});
-        const cp_out = try runCmdCheckedAlloc(a, &.{ "cp", "-a", src_with_dot, dst_abs }, out);
-        a.free(cp_out);
+        try runCmdCheckedInherit(a, &.{ "cp", "-a", src_with_dot, dst_abs }, out);
 
         if (restore_user) |ids| {
             const owner = try std.fmt.allocPrint(a, "{d}:{d}", .{ ids.uid, ids.gid });
-            const chown_out = try runCmdCheckedAlloc(a, &.{ "chown", "-R", owner, dst_abs }, out);
-            a.free(chown_out);
+            try runCmdCheckedInherit(a, &.{ "chown", "-R", owner, dst_abs }, out);
         }
 
         // Update progress count and log it.
