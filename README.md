@@ -1,8 +1,8 @@
 # distro-migrater-fi2f
-#### Video Demo:  <URL HERE>
+#### Video Demo:  https://youtu.be/mb6kDln25y8
 #### Description:
 distro-migrater-fi2f is a small but practical migration tool for backing up and restoring your dotfiles, flatpaks and layered-RPMs as normal RPMs from a Fedora immutable (OSTree-based) workstation to a Fedora mutable system. It is designed
-as a CS50 final project that solves a real problem I had: 
+as a CS50 final project that solves a real problem I had:
 I am using Bazzite on my main PC and freshly installed Fedora on my laptop. I wanted to restore my settings and apps on my laptop, without turning the tool into a risky "auto-magic" installer.
 
 The project is designed to run from a USB-stick.
@@ -50,7 +50,7 @@ The tool always prints a clear summary at the end of a restore, including:
 
 ## AI-tools I used
 - I created a project folder in ChatGPT and called it CS50.
-   It has a specialized prompt to not give me solutions directly and ask 
+   It has a specialized prompt to not give me solutions directly and ask
    socratic questions.
    The prompt text is included in `ChatGPT-Project System Prompt.txt`.
 - OpenAI Codex Addon for VS Code
@@ -58,7 +58,7 @@ The tool always prints a clear summary at the end of a restore, including:
   I also used it to solves issues where the ChatGPT tutor suggested solutions that
   worked for older zig versions but not 0.15.2 which I have written this code with.
 - Visual Studio Code AI-autocomplete
-  I used this one to complete long syntax from library functions so I didn't need 
+  I used this one to complete long syntax from library functions so I didn't need
   to type as much.
   I also used it to complete syntax I wasn't completely sure of since I am also using
   this project to learn zig.
@@ -68,7 +68,7 @@ The tool always prints a clear summary at the end of a restore, including:
 This repository is intentionally simple.
 
 - `ChatGPT-Project System Prompt.txt`
-  This is the system prompt I used to discuss my ideas with the ChatGPT-project 
+  This is the system prompt I used to discuss my ideas with the ChatGPT-project
   and get feedback and suggestions for my code.
 
 - `src/main.zig`
