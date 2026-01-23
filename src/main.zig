@@ -715,7 +715,8 @@ fn extractLayeredRpmsFromOstreeJsonBytes(
                     if (item == .string) {
                         const s = std.mem.trim(u8, item.string, " \t\r\n");
                         if (s.len == 0) continue;
-                        _ = try pkgs.put(s, {});
+                        const owned = try a.dupe(u8, s);
+                        _ = try pkgs.put(owned, {});
                     }
                 }
             }
@@ -1123,7 +1124,8 @@ fn loadLayeredRpmsFromStatusJson(
                     if (item == .string) {
                         const s = std.mem.trim(u8, item.string, " \t\r\n");
                         if (s.len == 0) continue;
-                        _ = try pkgs.put(s, {});
+                        const owned = try a.dupe(u8, s);
+                        _ = try pkgs.put(owned, {});
                     }
                 }
             }
