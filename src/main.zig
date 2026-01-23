@@ -4,9 +4,9 @@
 //   - Creates ./backups/backup-<unix_ts>/ (relative to current working dir)
 //   - Captures:
 //       1) flatpak-list.txt
-//       2) layered-rpms.txt               <-- CHANGED: minimal output instead of huge rpm-ostree JSON
+//       2) layered-rpms.txt
 //       3) flatpak-configs/<app_id>/config
-//       4) dot-config/                    <-- NEW: backup of ~/.config
+//       4) dot-config/
 //
 // Restore mode (on mutable):
 //   - Picks a backup folder
